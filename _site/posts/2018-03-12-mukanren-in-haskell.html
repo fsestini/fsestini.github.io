@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="x-ua-compatible" content="ie=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Filippo Sestini - Mu-Kanren in Haskell</title>
+        <link rel="stylesheet" href="../css/default.css" />
+    </head>
+    <body>
+        <header>
+            <div class="logo">
+                <a href="../">FILIPPO SESTINI</a>
+            </div>
+            <nav>
+                <a href="../">Home</a>
+                <a href="../about.html">About</a>
+                <a href="../contact.html">Contact</a>
+                <a href="../archive.html">Blog</a>
+            </nav>
+        </header>
+
+        <main role="main">
+            <h1>Mu-Kanren in Haskell</h1>
+            <article>
+    <section class="header">
+        Posted on March 12, 2018
+        
+    </section>
+    <section>
+        <p>In this post I want to go through a simple Haskell implementation of
+MuKanren. MuKanren is a minimal logic programming DSL, belonging to the Kanren
+family. In very few words, relational/logic programming is a paradigm embodying
+a highly declarative approach to problem solving. Consider the following
+definition of an append function, expressed in the DSL that we will build
+shortly:</p>
+<pre><code>append :: Term -&gt; Term -&gt; Term -&gt; Goal
+append l s o =
+  disj (conjs [nil === l, s === o])
+       (fresh 3 $ \[a,d,r] -&gt;
+	 conjs [TPair a d === l, TPair a r === o, appendo d s r])</code></pre>
+<p>The precise meaning of this definition will be clear soon. For now, it is
+sufficient to think of it as a ternary relation between list-like terms. As the
+name suggests, this relation holds whenever its third argument is the result of
+appending the first and the second.</p>
+<p>Given such a definition, the first thing we might want to do is to compute the
+result of appending two lists <code>l1</code> and <code>l2</code>. In relational terms, this amounts
+to <em>querying</em> the system for all output terms <code>l3</code> for which the relation
+<code>append l1 l2 l3</code> holds.</p>
+<pre><code>λ&gt; run 1 (callFreshV (\v -&gt; append (nums [1,2,3]) (nums [4,5,6]) v))
+(1 2 3 4 5 6)</code></pre>
+<p>Notice how we produce the output in s-expressions, to easily compare our results
+with the original Scheme implementation. As we’ll see, the <code>callFreshV</code> function
+introduces a new <em>logic variable</em>, that is used as argument for <code>append</code> to bind
+its result. The argument of <code>run</code> is a <em>goal</em>, which the function attempts to
+solve, returning one of the possible successful instantiations of the variable
+logic variable. Since the <code>append</code> relation is functional (i.e., it has the same
+output for every pair of inputs), the output we get is the only possible one.</p>
+<p>So far, there’s not much difference from your usual functional programming
+language. A more interesting example could be to query what is the list that
+needs to be appended to a given one to obtain another one as a result.</p>
+<pre><code>λ&gt; run 1 (callFreshV $ \v -&gt; append (nums [1,2,3]) v (nums [1,2,3,4,5]))
+(4 5)</code></pre>
+<p>We start to get a sense of how logic programming allows us to run programs
+`backwards’, starting from the outputs and synthesizing the desired inputs. But
+it gets more interesting: we could try to ask MuKanren to output all possible
+combinations of lists that, when appended, produce a specific output that we
+provide.</p>
+<pre><code>λ&gt; f x y z = conjs [appendo y z (nums [1,2,3]), x === list [y, z]]
+λ&gt; runAll (fresh 3 (\[x,y,z] -&gt; f x y z))
+(() (1 2 3))
+((1) (2 3))
+((1 2) (3))
+((1 2 3) ())</code></pre>
+<p>The logic program above creates three variables <code>x</code>,<code>y</code>,<code>z</code>, and succeeds
+whenever <code>[1,2,3]</code> is the result of appending <code>y</code> and <code>z</code>. The first argument
+<code>x</code> is used to “store” the two results in a list, for printing convenience. Like
+before, the results are instantiations of the first logic variable created in
+the goal. But now, as the name <code>runAll</code> suggests, we get <em>all</em> the possible
+results.</p>
+<p>With some motivating examples out of the way, we are ready to dig into the
+implementation. The <a href="http://www.webyrd.net/scheme-2013/papers/HemannMuKanren2013.pdf">original
+implementation</a>
+of MuKanren is just a few lines of Scheme, which is a demonstration of how concise
+functional programs can be. Remarkably, the equivalent Haskell implementation,
+shown below, is of about the same length, including type signatures and datatype
+declarations!</p>
+<h2 id="the-language">The language</h2>
+<p>To ease the comparison with the paper, I will try to keep my implementation as
+close as possible to the original. The central concepts of a MuKanren program
+are <em>goals</em>, <em>states</em> and, of course, <em>terms</em>. We’ll se later how terms are
+implemented, but for now we can assume to have a type <code>Term</code> of MuKanren terms.</p>
+<p><em>States</em> are basically pairs of a substitution (i.e., a map associating
+variables to terms) and a non-negative integer counter used to generate fresh
+variable names (represented as natural numbers as well).</p>
+<pre><code>type Var = Nat
+type Sub = [(Var, Term)]
+type State = (Sub, Nat)</code></pre>
+<p><em>Goals</em> can be seen as <em>proof-relevant predicates</em> on states: a goal is a
+function that, when applied to a state assigning values to its free logic
+variables, returns a sequence of result states in which the goal is satisfied. A
+non-empty list of states is a <em>proof</em> that the predicate is satisfiable,
+represented as the actual states that satisfy it.</p>
+<p><code>type Goal = State -&gt; [State]</code></p>
+<p>A MuKanren program will be represented by a goal, so <em>running</em> a program really
+just means applying it to an initial (usually empty) state. The result of a
+program execution will be the stream of states resulting from the application.</p>
+<p>Goals are constructed and assembled by means of a few basic operations, the most
+important of which is <em>unification</em>.</p>
+<p><code>(===) :: Term -&gt; Term -&gt; Goal</code></p>
+<p>The expression <code>t === s</code> represents a goal that succeeds if and only if the two
+terms <code>t</code> and <code>s</code> unify (in the given state). Unification goals are those
+actually responsible for growing the states, as some variables involved in the
+two terms may get instantiated in the process. So for example, trying to unify a
+variable <code>x</code> with a value <code>5</code> in the empty state will produce a stream of just a
+single new state: the one that maps <code>x</code> to the value <code>5</code>. The implementation of
+unification is addressed in a later section.</p>
+<p>The <code>callFresh</code> operation just calls an input goal with a new, fresh unification
+variable.</p>
+<pre><code>callFresh :: (Var -&gt; Goal) -&gt; Goal
+callFresh f sc = f c (fst sc , c + 1) where c = snd sc</code></pre>
+<p><code>callFresh</code> takes as input a continuation that accepts a new variable and
+returns a goal, and calls it with a variable freshly generated according to the
+variable counter in the current state.</p>
+<p>Goals can be combined by conjuction and disjuction operations.</p>
+<p><code>conj, disj :: Goal -&gt; Goal -&gt; Goal</code></p>
+<p>The disjunction goal <code>disj g1 g2</code> returns a non-empty stream if either of the
+two goals are successful. We can implement it as a simple interleaving of the
+two streams, so that results are selected in a fair way.</p>
+<pre><code>disj g1 g2 sc = interleave (g1 sc) (g2 sc)
+  where interleave xs ys = concat (transpose [xs, ys])</code></pre>
+<p>The conjunction goal <code>conj g1 g2</code> returns a non-empty stream if the second
+argument can be achieved in the stream of states generated by the first. In
+particular, it returns all the result states of <code>g2</code> that are successful in some
+result state of <code>g1</code>, which is exactly what is achieved by the <code>&gt;&gt;=</code> instance
+for the list monad.</p>
+<pre><code>conj g1 g2 sc = g1 sc &gt;&gt;= g2</code></pre>
+<h2 id="terms">Terms</h2>
+<p>The original code uses (a subset of) Scheme itself as the object language. More
+precisely, MuKanren expressions are all those S-expressions made of variables
+and objects that can be tested for equality, and that are therefore accepted by
+the unification algorithm. We won’t borrow a piece of Haskell syntax here, but
+instead define a data type <code>Term</code> that quite faithfully complies with the
+specification just given.</p>
+<pre><code>data Atom where
+  AVar :: Var -&gt; Atom
+  AData :: (Eq a, Show a, Typeable a) =&gt; a -&gt; Atom
+
+type Term = SExpr Atom
+pattern TPair a t = SCons a t
+pattern TData d = A (AData d)</code></pre>
+<p>A MuKanren term is an s-expression of atomic values <code>Atom</code>, which can be either
+variables (<code>AVar</code>) or arbitrary data (<code>AData</code>). The <code>SExpr</code> datatype of
+s-expressions comes from the <code>s-cargot</code> package, which also conveniently offers
+some pretty-printing facility.</p>
+<p>The constructor for variables is probably not that mind-blowing. More
+interesting is the definition of the <code>AData</code> constructor. The notion of “term”
+used in the paper clearly assumes an underlying
+<a href="https://existentialtype.wordpress.com/2011/03/19/dynamic-languages-are-static-languages">unityped</a>
+programming language, particularly since it accepts objects of any shape or
+form, as long as they can be compared for equality by the unification
+function. An analogous result might seem quite difficult to achieve in a
+strongly typed environment, but it really isn’t.</p>
+<p><code>AData</code>’s declaration uses an existentially quantified type variable.
+Existential quantification over type variables is a known typed FP idiom, and it
+enables a principled form of “dynamic typing” through a simple process of
+abstraction. In an expressively typed language like Haskell, dynamism is
+achieved by selectively forgetting about details of the type structure that we
+don’t care about, while remembering some others. In our case, <code>AData</code> abstracts
+over the particular type of data in use, existentially quantifying over <code>a</code>, but
+explicitly remembers some details, in the form of typeclass instances that must
+exist for the type. This definition allows us to treat elements of any type as
+terms of our language, as long as their type can be unpacked and inspected later
+at runtime (<code>Typeable a</code>), as well as tested for equality (<code>Eq a</code>). We also ask
+them to be <code>Show</code>able, as printing out some program results might come in handy.</p>
+<!--Here's a small example using the `list :: [Term] -> Term` utility function to
+build a an s-expr list out of a Haskell list of terms.
+
+```
+λ> putStrLn . printTerm $ list [TData 1, TData "hello", TData 2, TData ()]
+(1 "hello" 2 ())
+```
+-->
+<h2 id="unification">Unification</h2>
+<p>The unification algorithm is taken almost verbatim from the paper. The <code>unify</code>
+function tries to unify two terms with respect to a base substitution assigning
+a value to some of the terms’ free variables. In case of success, a new
+substitution is returned that is at least as defined as the input one, but
+possibly extended with new bindings. The algorithm relies of an additional
+function <code>walk</code> (not shown here) that simply traverses a term, applying a
+substitution to it.</p>
+<pre><code>unify :: Term -&gt; Term -&gt; Sub -&gt; Maybe Sub
+unify u v s = aux (walk u s) (walk v s)
+  where
+    aux :: Term -&gt; Term -&gt; Maybe Sub
+    aux (TVar u) (TVar v) | u == v = Just s
+    aux (TVar u) v = Just ((u, v) : s)
+    aux u (TVar v) = Just ((v, u) : s)
+    aux Nil Nil    = Just s
+    aux (TPair u v) (TPair u' v') = aux u u' &gt;&gt;= unify v v'
+    aux (TData x) (TData y) = x ~= y &gt;&gt;= bool Nothing (Just s)
+    aux _ _ = Nothing</code></pre>
+<p>Again, the most interesting part is the test of <code>TData</code> elements for equality.
+Pattern matching on them has the effect of unpacking the quantified types and
+bringing them to scope. Of course, now the type variables of the inner <code>x</code> and
+<code>y</code> are different, since there’s no guarantee these objects have the same type
+(and that was the point of it all). Luckily, we know that these types can be
+inspected to see if they are the same, and if they are, the corresponding
+elements can be compared for equality. We do exactly this in the comparison
+function <code>~=</code> below:</p>
+<pre><code>(~=) :: (Eq a, Typeable a, Typeable b) =&gt; a -&gt; b -&gt; Maybe Bool
+x ~= y = fmap (\HRefl -&gt; x == y) (eqTypeRep (typeOf x) (typeOf y))</code></pre>
+<p>The function <code>eqTypeRep</code>, from <code>Type.Reflection</code>, returns a <code>Maybe (a :~~: b)</code>,
+where <code>a :~~: b</code> is the type of (kind-heterogeneous) propositional type
+equality. The only constructor is <code>HRefl</code>, which when pattern matched brings
+into scope a witness of <code>a ~ b</code>, allowing us to test elements of type <code>a</code> and
+<code>b</code> with the <code>Eq</code> instance of <code>a</code>.</p>
+<p>The unification goal constructor is then one that takes two terms as input and
+tries to unify them under the substitution of the provided state. If
+successful, the result is just a singleton stream composed of the output
+substitution produced by unification, and an unchanged fresh variable counter.</p>
+<pre><code>(===) :: Term -&gt; Term -&gt; Goal
+(u === v) st = maybe Nil (\nu -&gt; pure (nu, snd st)) (unify u v (fst st))</code></pre>
+<h2 id="a-first-implementation">A first implementation</h2>
+<p>So far, the implementation seems good enough. We can even run the first example
+in the paper and get the correct result:</p>
+<pre><code>num :: Int -&gt; Term
+num = TData
+
+emptyState :: State
+emptyState = ([], 0)
+
+aAndB :: Goal
+aAndB = fresh 2 $ \[a,b] -&gt;
+  conj (a === num 7) (disj (b === num 5) (b === num 6))</code></pre>
+<pre><code>λ&gt; aAndB emptyState
+[([(1,5),(0,7)],2), ([(1,6),(0,7)],2)]</code></pre>
+<p>However, the current state of affairs does not allow us to treat diverging goals
+correctly. Consider the following, degenerate example:</p>
+<pre><code>loop :: Goal
+loop = disj loop (num 0 === num 0)</code></pre>
+<p>The recursion on the left branch of the disjunction clearly
+diverges. Nevertheless, according to the meaning of disjunction, we should be
+able to witness a success for the overall goal, since the right branch of the
+disjunction is trivially satisfied by any state that is passed as input. In
+other words, we expect the stream produced by running this goal to be
+<em>productive</em>. A productive stream is one that always produces a value (i.e., its
+head) in finite time. Notice that we <em>do not</em> want to rule out diverging
+programs from the set of valid MuKanren programs. What we want is to be able to
+write recursive MuKanren goals so that diverging ones still lead to overall
+productive output streams. With the current implementation, this is not
+possible.</p>
+<h2 id="delayed-streams">Delayed streams</h2>
+<p>The paper’s solution to non-terminating search is twofold. First, the search
+strategy is changed from the incomplete depth-first search to a breadth-first
+strategy (we already took care of this by implementing <code>disj</code> in terms of
+<code>interleave</code>). This ensures that the algorithm does not loses itself into
+infinite branches of the search space, and instead always returns a solution in
+finite time, if there is one. This alone is not sufficient to achieve
+productivity and avoid non-termination, given Scheme’s call-by-value semantics:
+the search algorithm would still try to eagerly search an infinite space until
+its end, before returning any result. This is avoided by introducing <em>delay
+fences</em> in the form of what they call <em>reverse eta expansion</em>. More precisely, a
+goal <code>g</code>, when eta expanded, becomes</p>
+<pre><code>(lambda (sc) (lambda () (g sc)))</code></pre>
+<p>This amounts to the well known technique of enclosing an expression in a lambda
+abstraction accepting a bogus argument, in order to create a <em>thunk</em>, or
+suspended computation, that allows to simulate lazy evaluation. Suspension
+happens thanks to the fact that computation never happens under binders.</p>
+<p>Reverse eta expansion still requires some modification to the rest of the
+implementation. In particular, goal constructors need to account for the
+presence of suspended computations. An example of how this is done is in the
+<code>mplus</code> function.</p>
+<pre><code>(define (mplus $1 $2)
+  (cond
+    ((null? $1) $2)
+    ((procedure? $1) (lambda () (mplus $2 ($1))))
+    (else (cons (car $1) (mplus (cdr $1) $2)))))</code></pre>
+<p>What <code>mplus</code> does is to interleave streams of states, consuming the first input
+stream until a suspended computation is encountered. At that point, the delay
+fence is removed, and the inputs are swapped to ensure a breadth-first-like
+distribution of search.</p>
+<p>The above solution is simple and effective. Unfortunately, the user still has to
+manually guard all potentially dangerous recursive calls with delay fences for
+the solution to really work. This is anyway in line with the simple and terse
+nature of MuKanren.</p>
+<p>The techniques we have just seen are quite familiar to a Haskell programmer,
+where lazy evaluation and guarded recursion are the default. Guarded recusion
+alone, however, is of no help whatsoever if the stream being consumed is not
+productive (as in the diverging example above). We still need a way to
+explicitly introduce delays in the computation of streams. But since Haskell
+constructors are evaluated lazily by default, introducing a delay fence is just
+a matter of adding a constructor.</p>
+<pre><code>type Res = [Maybe State]</code></pre>
+<p>Goals now return lists/streams of <code>Maybe State</code>s as results. In such a list,
+elements constructed out of <code>Just</code> are to be interpreted as legit outputs,
+whereas <code>Nothing</code> is used to <em>“delay”</em> a stream-returning computation with a
+dummy value that, thanks to lazy evaluation, is enough to prevent divergence and
+ensure productivity.</p>
+<pre><code>λ&gt; import Data.Maybe (catMaybes)
+λ&gt; delay = (Nothing :)
+λ&gt; loop = delay loop
+λ&gt; take 10 . catMaybes $ interleave loop (fmap Just [1..])
+[1,2,3,4,5,6,7,8,9,10]</code></pre>
+<p>Apart from writing a <code>Maybe</code> in front of <code>State</code>, there are still a couple of
+small changes to the <code>conj</code> and <code>disj</code> functions. <code>conj</code> was originally
+implemented as</p>
+<pre><code>conj g1 g2 sc = g1 sc &gt;&gt;= g2</code></pre>
+<p>This definition doesn’t typecheck anymore: since <code>g1 sc</code> now produces a list of
+<code>Maybe State</code>, the <code>&gt;&gt;=</code> operator for the list monad ends up feeding <code>Maybe State</code>s into <code>g2</code>. But <code>g2</code>, being a <code>Goal</code>, takes <code>State</code> as input rather than
+<code>Maybe State</code>. We need a way to send to <code>g2</code> only those <code>Maybe State</code> that are
+legit results, namely those constructed from <code>Just</code>. This kind of behaviour
+resembles the <code>Monad</code> instance for <code>Maybe</code>, and indeed, the composition of <code>[]</code>
+and <code>Maybe</code> that we are dealing with forms a monad, with a <code>&gt;&gt;=</code> operator having
+just the behaviour we need!</p>
+<p>To access the <code>Monad</code> instance for the composition of <code>[]</code> and <code>Maybe</code>, we use
+the <code>MaybeT</code> monad transformer from the <code>transformers</code> package. All it takes is
+a couple of <code>MaybeT</code> wrappers, and a <code>runMaybeT</code> to unwrap the result. The types
+then take care of selecting the right instance of <code>&gt;&gt;=</code> for us.</p>
+<pre><code>conj g1 g2 sc = runMaybeT (MaybeT (g1 sc) &gt;&gt;= MaybeT . g2)</code></pre>
+<p>Our current <code>disj</code> implementation uses a simple interleaving function to lazily
+mix two input streams. In other words, the function switches to the second
+stream as soon as the first returns <em>some</em> value, be it a legit value of a delay
+(i.e., <code>Nothing</code>) value. This means that a basic amout of fairness is ensured
+automatically, but it also means that the user of the DSL has no control on it.</p>
+<p>The <code>disj</code> function in the original Scheme version is slightly different, as it
+explores the first disjunct <em>depth first</em>, until a suspended computation is
+encountered. At that point, control is yielded and the second disjunct is
+explored. The user of the DSL is in complete control of the search strategy for
+disjunctive goals, but now fairness must be ensured manually, or by auxiliary
+wrapper combinators.</p>
+<p>I’ll stick with the original version of <code>disj</code>, which can be implemented by
+tweaking <code>interleave</code> according to our needs.</p>
+<pre><code>interleave
+disj g1 g2 sc = concat $ (interleave `on` f) (g1 sc) (g2 sc)
+  where f = (split . keepDelimsR . whenElt) isNothing</code></pre>
+<p>The auxiliary function <code>f</code> groups the input streams by contiguous sequences of
+<code>Just</code>s, splitting at the first occurrence of a <code>Nothing</code>. These chunks are then
+passed to the <code>interleave</code> function, as before. The result is that now, instead
+of yielding after one single output, we yield at the end of a contigous sequence
+of legit values. Overall, the <code>disj</code> function stays concise and declarative,
+since preserving the necessary laziness in consuming the input streams is taken
+care of automatically.</p>
+<h2 id="a-working-implementation">A working implementation</h2>
+<p>We can now write some utility functions</p>
+<pre><code>conjs, disjs :: [Goal] -&gt; Goal
+conjs = foldr1 conj
+disjs = foldr1 (\g1 -&gt; disj g1 . (delay .)</code></pre>
+<p>The meaning of the functions above is quite self-explanatory. As in the Scheme
+version, <code>disjs</code> inserts a delay in front of the second disjunct, so control is
+yielded before attempting to solve the corresponding goal. This allows to
+achieve some fairness when solving goals constructed for example, as simple
+disjunctions of conjunctions, as we’ll se in a moment. Unlike the Scheme
+implementation, our <code>conjs</code> and <code>disjs</code> are plain functions, rather than macros.</p>
+<p>To print some useful results, we adapt the reification code from the original
+Scheme implementation into a function <code>reifyFst</code>, which extracts the value
+associated to the first variable in an input <code>State</code>.</p>
+<pre><code>deepWalk :: Term -&gt; Sub -&gt; Term
+deepWalk t s = case walk t s of
+  TPair t1 t2 -&gt; TPair (deepWalk t1 s) (deepWalk t2 s)
+  t' -&gt; t'
+
+data ReifiedVar = RV Int deriving Eq
+instance Show ReifiedVar where show (RV i) = &quot;_.&quot; ++ show i
+
+reifyS :: Term -&gt; Sub -&gt; Sub
+reifyS t s = case walk t s of
+  TVar v -&gt; let n = TData (RV (length s)) in (v, n) : s
+  TPair t1 t2 -&gt; reifyS t2 (reifyS t1 s)
+  _ -&gt; s
+
+reifyFst :: State -&gt; Term
+reifyFst sc = let v = deepWalk (TVar 0) (fst sc) in deepWalk v (reifyS v [])</code></pre>
+<p>To query a goal for the first <code>n</code> valid instantiations of the first logic
+variable, we try to solve it in the empty state,
+throw away the bogus <code>Nothing</code> results, and take <code>n</code> out of what is left:</p>
+<pre><code>printRes :: [State] -&gt; IO ()
+printRes = mapM_ (putStrLn . printTerm) . fmap reifyFst
+
+run :: Int -&gt; Goal -&gt; IO ()
+run n g = printRes . take n . catMaybes $ g emptyState</code></pre>
+<pre><code>λ&gt; anyo g = disj g (delay . anyo g)
+λ&gt; run 5 $ callFresh $ \x -&gt; disj (anyo (TVar x === num 1)) (anyo (TVar x === num 2))
+1
+2
+1
+2
+1</code></pre>
+<pre><code>λ&gt; loop = delay . loop
+λ&gt; run 5 $ callFresh (\x -&gt; disj loop (anyo (TVar x === num 1)))
+1
+1
+1
+1
+1</code></pre>
+<p>Notice the trampolining effect of the delay fences, which is exactly what we
+wanted to achieve as a result of breadth-first search.</p>
+<h2 id="a-more-involved-example-appendo">A more involved example: <code>appendo</code></h2>
+<pre><code>appendo :: Term -&gt; Term -&gt; Term -&gt; Goal
+appendo l s o =
+  disj (conj (TData () === l) (s === o)) $
+    callFresh $ \a -&gt;
+      callFresh $ \d -&gt;
+	callFresh $ \r -&gt;
+	  conjs [ TPair (TVar a) (TVar d) === l
+		, TPair (TVar a) (TVar r) === o
+		, appendo (TVar d) s (TVar r) ]</code></pre>
+<p>The right-leaning chain of <code>callFresh</code> and lambdas gets tiresome pretty quickly.
+Fortunately, observing the continuation-passing style signature of <code>callFresh</code>,
+we can exploit the continuation monad and Haskell’s do-notation to streamline
+the sequence of variable creations.</p>
+<pre><code>callFresh' :: Cont Goal Var
+callFresh' = cont callFresh
+
+appendo :: Term -&gt; Term -&gt; Term -&gt; Goal
+appendo l s o =
+  disj (conj (TData () === l) (s === o)) $ runG $ do
+    a &lt;- callFresh'
+    d &lt;- callFresh'
+    r &lt;- callFresh'
+    pure $ conjs [ TPair (TVar a) (TVar d) === l
+		 , TPair (TVar a) (TVar r) === o
+		 , appendo (TVar d) s (TVar r) ]</code></pre>
+    </section>
+</article>
+
+        </main>
+
+        <footer>
+            Site proudly generated by
+            <a href="http://jaspervdj.be/hakyll">Hakyll</a>
+        </footer>
+    </body>
+</html>
